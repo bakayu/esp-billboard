@@ -272,7 +272,8 @@ function evaluateScores(scores, thresholds) {
 
     const threshold = Math.max(MODERATION_MIN_SCORE, thresholds[c.key] || 0);
     const marginFromOther = score - strongestOther;
-    if (score >= threshold && marginFromOther >= MODERATION_MARGIN) {
+    const requiredMargin = c.key === "alcohol" ? 0 : MODERATION_MARGIN;
+    if (score >= threshold && marginFromOther >= requiredMargin) {
       blocked.push(c.key);
     }
   }
@@ -1162,11 +1163,6 @@ export default function App() {
 
     if (isSending || isPaying) return;
 
-    if (SOLANA_REQUIRED) {
-      const paid = await payForCurrentFrame();
-      if (!paid) return;
-    }
-
     if (requireModeration) {
       const currentHash = frameHash(pixelsRef.current);
       const alreadyApproved =
@@ -1177,6 +1173,11 @@ export default function App() {
         const ok = await runModeration();
         if (!ok) return;
       }
+    }
+
+    if (SOLANA_REQUIRED) {
+      const paid = await payForCurrentFrame();
+      if (!paid) return;
     }
 
     try {
@@ -1206,7 +1207,7 @@ export default function App() {
       <header className="app-header">
         <h1>Pixel Portal</h1>
         <p className="subtitle">
-          Draw, pay per pixel on Solana, moderate, then stream to gateway
+          Draw, moderate, pay per pixel on Solana, then stream to gateway
         </p>
         <div className="status-pills">
           <span className="pill">Gateway: {serialState}</span>
