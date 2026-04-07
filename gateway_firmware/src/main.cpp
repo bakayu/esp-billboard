@@ -15,6 +15,14 @@
 #define CHUNK_HEADER 7
 #define MAX_CHUNKS ((FRAME_BYTES + CHUNK_DATA - 1) / CHUNK_DATA)
 
+#define TX_ACTIVITY_LED_PIN 33
+#define POWER_LED_PIN 32
+#define LED_ACTIVE HIGH
+#define TX_LED_PULSE_MS 70
+#define TX_LED_BLINK_COUNT 3
+#define TX_IDLE_BLINK_INTERVAL_MS 1000
+#define TX_IDLE_BLINK_ON_MS 80
+
 // Display MAC: 30:76:F5:F3:A0:F4
 uint8_t DISPLAY_MAC[6] = {0x30, 0x76, 0xF5, 0xF3, 0xA0, 0xF4};
 
@@ -34,6 +42,8 @@ enum RxState : uint8_t {
 RxState rxState = RX_SYNC_F;
 uint16_t rxExpectedLen = 0;
 uint16_t rxIndex = 0;
+bool txIdleBlinkOn = false;
+unsigned long txIdleBlinkTickMs = 0;
 
 void resetParser() {
   rxState = RX_SYNC_F;
@@ -46,6 +56,64 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   if (status != ESP_NOW_SEND_SUCCESS) {
     Serial.println("ESP-NOW send callback: fail");
   }
+}
+
+void initStatusLeds() {
+  pinMode(TX_ACTIVITY_LED_PIN, OUTPUT);
+  digitalWrite(TX_ACTIVITY_LED_PIN, !LED_ACTIVE);
+
+#if POWER_LED_PIN >= 0
+  pinMode(POWER_LED_PIN, OUTPUT);
+  digitalWrite(POWER_LED_PIN, LED_ACTIVE);
+#endif
+
+  txIdleBlinkOn = false;
+  txIdleBlinkTickMs = millis();
+}
+
+void serviceIdleTxBlink() {
+  const unsigned long now = millis();
+
+  if (!txIdleBlinkOn) {
+    if (now - txIdleBlinkTickMs >= TX_IDLE_BLINK_INTERVAL_MS) {
+      digitalWrite(TX_ACTIVITY_LED_PIN, LED_ACTIVE);
+      txIdleBlinkOn = true;
+      txIdleBlinkTickMs = now;
+    }
+    return;
+  }
+
+  if (now - txIdleBlinkTickMs >= TX_IDLE_BLINK_ON_MS) {
+    digitalWrite(TX_ACTIVITY_LED_PIN, !LED_ACTIVE);
+    txIdleBlinkOn = false;
+    txIdleBlinkTickMs = now;
+  }
+}
+
+void blinkTxLedOnFrameSent() {
+  txIdleBlinkOn = false;
+
+  for (uint8_t i = 0; i < TX_LED_BLINK_COUNT; i++) {
+    // Phase A: white ON, yellow OFF
+    digitalWrite(TX_ACTIVITY_LED_PIN, LED_ACTIVE);
+#if POWER_LED_PIN >= 0
+    digitalWrite(POWER_LED_PIN, !LED_ACTIVE);
+#endif
+    delay(TX_LED_PULSE_MS);
+
+    // Phase B: yellow ON, white OFF (completes one cycle)
+    digitalWrite(TX_ACTIVITY_LED_PIN, !LED_ACTIVE);
+#if POWER_LED_PIN >= 0
+    digitalWrite(POWER_LED_PIN, LED_ACTIVE);
+#endif
+    delay(TX_LED_PULSE_MS);
+  }
+
+  digitalWrite(TX_ACTIVITY_LED_PIN, !LED_ACTIVE);
+#if POWER_LED_PIN >= 0
+  digitalWrite(POWER_LED_PIN, LED_ACTIVE);
+#endif
+  txIdleBlinkTickMs = millis();
 }
 
 bool initEspNowTx() {
@@ -86,7 +154,7 @@ bool initEspNowTx() {
   return true;
 }
 
-void sendFrameViaEspNow(const uint8_t *frame) {
+bool sendFrameViaEspNow(const uint8_t *frame) {
   txFrameId++;
   const uint8_t totalChunks = (uint8_t)MAX_CHUNKS;
 
@@ -108,18 +176,21 @@ void sendFrameViaEspNow(const uint8_t *frame) {
     esp_err_t e = esp_now_send(DISPLAY_MAC, pkt, CHUNK_HEADER + payloadLen);
     if (e != ESP_OK) {
       Serial.printf("esp_now_send failed at chunk %u err=%d\n", idx, (int)e);
-      return;
+      return false;
     }
 
     delay(2);
   }
 
   Serial.printf("TX frame %u (%u bytes)\n", txFrameId, FRAME_BYTES);
+  return true;
 }
 
 void onFrameReadyFromSerial() {
-  sendFrameViaEspNow(rxFrame);
-  Serial.println("OK F888 -> ESPNOW");
+  if (sendFrameViaEspNow(rxFrame)) {
+    blinkTxLedOnFrameSent();
+    Serial.println("OK F888 -> ESPNOW");
+  }
 }
 
 void processIncomingByte(uint8_t b) {
@@ -173,6 +244,8 @@ void setup() {
   Serial.begin(BAUD_RATE);
   delay(500);
 
+  initStatusLeds();
+
   if (!initEspNowTx()) {
     Serial.println("Gateway init failed");
     while (true) delay(1000);
@@ -183,6 +256,8 @@ void setup() {
 }
 
 void loop() {
+  serviceIdleTxBlink();
+
   while (Serial.available() > 0) {
     processIncomingByte((uint8_t)Serial.read());
   }

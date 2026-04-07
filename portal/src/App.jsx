@@ -13,7 +13,17 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   LoaderCircle,
+  Wallet,
 } from "lucide-react";
+
+let web3ModulePromise = null;
+
+async function loadWeb3() {
+  if (!web3ModulePromise) {
+    web3ModulePromise = import("@solana/web3.js");
+  }
+  return web3ModulePromise;
+}
 
 const W = 32;
 const H = 16;
@@ -31,6 +41,21 @@ const MODERATION_MIN_SCORE = Number(
 const MODERATION_MARGIN = Number(
   import.meta.env.VITE_MODERATION_MARGIN || "0.08",
 );
+const SOLANA_REQUIRED =
+  String(import.meta.env.VITE_SOLANA_REQUIRED || "true").toLowerCase() !==
+  "false";
+const SOLANA_RPC_URL =
+  import.meta.env.VITE_SOLANA_RPC_URL || "http://127.0.0.1:8899";
+const SOLANA_PROGRAM_ID = import.meta.env.VITE_SOLANA_PROGRAM_ID || "";
+const SOLANA_COMMITMENT = import.meta.env.VITE_SOLANA_COMMITMENT || "confirmed";
+const HARD_DEFAULT_LAMPORTS_PER_PIXEL = Number(
+  import.meta.env.VITE_DEFAULT_LAMPORTS_PER_PIXEL || "2000",
+);
+const DEFAULT_LAMPORTS_PER_PIXEL =
+  Number.isFinite(HARD_DEFAULT_LAMPORTS_PER_PIXEL) &&
+  HARD_DEFAULT_LAMPORTS_PER_PIXEL > 0
+    ? Math.floor(HARD_DEFAULT_LAMPORTS_PER_PIXEL)
+    : 2000;
 
 const MODERATION_CATEGORIES = [
   {
@@ -247,7 +272,8 @@ function evaluateScores(scores, thresholds) {
 
     const threshold = Math.max(MODERATION_MIN_SCORE, thresholds[c.key] || 0);
     const marginFromOther = score - strongestOther;
-    if (score >= threshold && marginFromOther >= MODERATION_MARGIN) {
+    const requiredMargin = c.key === "alcohol" ? 0 : MODERATION_MARGIN;
+    if (score >= threshold && marginFromOther >= requiredMargin) {
       blocked.push(c.key);
     }
   }
@@ -276,6 +302,75 @@ function normalizedThresholds(input) {
     }
   }
   return out;
+}
+
+function countUsedPixels(pixels) {
+  let count = 0;
+  for (const p of pixels) {
+    if (p[0] !== 0 || p[1] !== 0 || p[2] !== 0) count += 1;
+  }
+  return count;
+}
+
+function shortAddress(address) {
+  if (!address) return "disconnected";
+  if (address.length < 12) return address;
+  return address.slice(0, 4) + "..." + address.slice(-4);
+}
+
+function formatLamports(lamports) {
+  const n = Number(lamports || 0);
+  if (!Number.isFinite(n)) return "0";
+  return n.toLocaleString();
+}
+
+function formatSol(lamports) {
+  const n = Number(lamports || 0) / 1_000_000_000;
+  if (!Number.isFinite(n)) return "0";
+  return n.toFixed(6);
+}
+
+function readU64Le(data, offset) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  return view.getBigUint64(offset, true);
+}
+
+function parseConfigAccountData(data, PublicKeyCtor) {
+  // Anchor layout: 8 discriminator + authority 32 + treasury 32 + price 8 + bump 1
+  if (!data || data.length < 81) {
+    throw new Error("Config account not found or has invalid size");
+  }
+  const treasury = new PublicKeyCtor(data.slice(40, 72));
+  const lamportsPerPixel = readU64Le(data, 72);
+  const bump = data[80];
+  return { treasury, lamportsPerPixel, bump };
+}
+
+function toU16Le(value) {
+  const out = new Uint8Array(2);
+  const view = new DataView(out.buffer);
+  view.setUint16(0, value, true);
+  return out;
+}
+
+async function anchorDiscriminator(methodName) {
+  const bytes = new TextEncoder().encode("global:" + methodName);
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return new Uint8Array(hash).slice(0, 8);
+}
+
+async function payPerPixelIxData(pixelCount) {
+  const discriminator = await anchorDiscriminator("pay_per_pixel");
+  const arg = toU16Le(pixelCount);
+  const data = new Uint8Array(10);
+  data.set(discriminator, 0);
+  data.set(arg, 8);
+  return data;
+}
+
+function getWalletProvider() {
+  if (typeof window === "undefined") return null;
+  return window.phantom?.solana || window.solana || null;
 }
 
 async function moderateViaApi(pixels, thresholds) {
@@ -386,10 +481,22 @@ export default function App() {
   );
   const [strictModeration, setStrictModeration] = useState(false);
   const [showPolicyPanel, setShowPolicyPanel] = useState(false);
+  const [walletAddress, setWalletAddress] = useState("");
+  const [isPaying, setIsPaying] = useState(false);
+  const [lastPaymentSig, setLastPaymentSig] = useState("");
+  const [solanaConfig, setSolanaConfig] = useState(null);
+  const [solanaStatus, setSolanaStatus] = useState("Solana not initialized");
+  const [web3, setWeb3] = useState(null);
+  const [connection, setConnection] = useState(null);
+  const [programId, setProgramId] = useState(null);
+  const [toasts, setToasts] = useState([]);
+  const toastSeqRef = useRef(0);
 
   // Keep original uploaded image so fit mode can be toggled live
   const [loadedImage, setLoadedImage] = useState(null);
   const lastModeratedHashRef = useRef(null);
+
+  const walletProvider = useMemo(() => getWalletProvider(), []);
 
   const canUseSerial = useMemo(
     () => typeof navigator !== "undefined" && "serial" in navigator,
@@ -400,6 +507,17 @@ export default function App() {
     () => prettyCategoryList(moderation.blocked),
     [moderation.blocked],
   );
+  const usedPixels = useMemo(() => countUsedPixels(pixels), [pixels]);
+  const priceInfo = useMemo(() => {
+    const value = Number(solanaConfig?.lamportsPerPixel);
+    if (Number.isFinite(value) && value > 0) {
+      return { lamports: value, source: "on-chain" };
+    }
+    return { lamports: DEFAULT_LAMPORTS_PER_PIXEL, source: "local" };
+  }, [solanaConfig?.lamportsPerPixel]);
+  const estimatedLamports = useMemo(() => {
+    return usedPixels * priceInfo.lamports;
+  }, [priceInfo.lamports, usedPixels]);
 
   const editorCursor = tool === "erase" ? ERASE_CURSOR : DRAW_CURSOR;
 
@@ -407,9 +525,263 @@ export default function App() {
   const canRedo = redoStackRef.current.length > 0;
   const hasUploadedImage = !!loadedImage;
 
+  const dismissToast = useCallback((id) => {
+    setToasts((prev) => prev.filter((toast) => toast.id !== id));
+  }, []);
+
+  const pushToast = useCallback(
+    (message, tone = "info", ttlMs = 3200) => {
+      const id = toastSeqRef.current + 1;
+      toastSeqRef.current = id;
+      setToasts((prev) => [...prev, { id, message, tone }]);
+
+      setTimeout(() => {
+        dismissToast(id);
+      }, ttlMs);
+    },
+    [dismissToast],
+  );
+
+  const fetchSolanaConfig = useCallback(async () => {
+    if (!SOLANA_REQUIRED) return null;
+    if (!web3 || !connection) {
+      throw new Error("Solana client not loaded yet");
+    }
+    if (!programId) {
+      throw new Error("Missing or invalid VITE_SOLANA_PROGRAM_ID");
+    }
+
+    const [configPda] = web3.PublicKey.findProgramAddressSync(
+      [new TextEncoder().encode("config")],
+      programId,
+    );
+
+    const info = await connection.getAccountInfo(configPda, SOLANA_COMMITMENT);
+    if (!info?.data) {
+      throw new Error("Protocol config account not found on current cluster");
+    }
+
+    const parsed = parseConfigAccountData(info.data, web3.PublicKey);
+    const next = {
+      configPda,
+      treasury: parsed.treasury,
+      lamportsPerPixel: Number(parsed.lamportsPerPixel),
+    };
+    setSolanaConfig(next);
+    setSolanaStatus(
+      "Config loaded: " +
+        formatLamports(next.lamportsPerPixel) +
+        " lamports/pixel",
+    );
+    return next;
+  }, [connection, programId, web3]);
+
+  const connectWallet = useCallback(async () => {
+    if (!SOLANA_REQUIRED) return null;
+    if (!walletProvider) {
+      throw new Error("No Solana wallet detected. Install Phantom/Solflare.");
+    }
+
+    const resp = await walletProvider.connect();
+    const pk = resp?.publicKey || walletProvider.publicKey;
+    if (!pk) {
+      throw new Error("Wallet connection did not return a public key");
+    }
+
+    const address = pk.toBase58();
+    setWalletAddress(address);
+    setSolanaStatus("Wallet connected: " + shortAddress(address));
+    return pk;
+  }, [walletProvider]);
+
+  const payForCurrentFrame = useCallback(async () => {
+    if (!SOLANA_REQUIRED) return true;
+    if (usedPixels <= 0) {
+      setStatus("Draw at least one colored pixel before upload");
+      return false;
+    }
+    if (!walletProvider) {
+      setStatus("Install a Solana wallet (Phantom/Solflare)");
+      return false;
+    }
+    if (!web3 || !connection) {
+      setStatus("Solana client is still loading");
+      return false;
+    }
+    if (!programId) {
+      setStatus("Missing VITE_SOLANA_PROGRAM_ID");
+      return false;
+    }
+
+    try {
+      setIsPaying(true);
+      setSolanaStatus("Preparing payment transaction");
+
+      const payer = walletProvider.publicKey || (await connectWallet());
+      if (!payer) throw new Error("Wallet unavailable after connect");
+
+      let cfg = solanaConfig;
+      if (!cfg) {
+        cfg = await fetchSolanaConfig();
+      }
+      if (!cfg) throw new Error("Protocol config unavailable");
+
+      const price = Number(cfg.lamportsPerPixel || 0);
+      const amountLamports = price * usedPixels;
+      if (!Number.isFinite(amountLamports) || amountLamports <= 0) {
+        throw new Error("Invalid on-chain price configuration");
+      }
+
+      const ixData = await payPerPixelIxData(usedPixels);
+      const ix = new web3.TransactionInstruction({
+        programId,
+        keys: [
+          { pubkey: payer, isSigner: true, isWritable: true },
+          { pubkey: cfg.configPda, isSigner: false, isWritable: false },
+          { pubkey: cfg.treasury, isSigner: false, isWritable: true },
+          {
+            pubkey: web3.SystemProgram.programId,
+            isSigner: false,
+            isWritable: false,
+          },
+        ],
+        data: ixData,
+      });
+
+      const tx = new web3.Transaction().add(ix);
+      tx.feePayer = payer;
+
+      const latest = await connection.getLatestBlockhash(SOLANA_COMMITMENT);
+      tx.recentBlockhash = latest.blockhash;
+
+      setSolanaStatus(
+        "Awaiting wallet confirmation for " +
+          formatLamports(amountLamports) +
+          " lamports",
+      );
+      const sent = await walletProvider.signAndSendTransaction(tx);
+      const signature = typeof sent === "string" ? sent : sent?.signature;
+      if (!signature) throw new Error("Wallet returned empty signature");
+
+      await connection.confirmTransaction(
+        {
+          signature,
+          blockhash: latest.blockhash,
+          lastValidBlockHeight: latest.lastValidBlockHeight,
+        },
+        SOLANA_COMMITMENT,
+      );
+
+      setLastPaymentSig(signature);
+      setSolanaStatus("Payment confirmed: " + signature.slice(0, 10) + "...");
+      return true;
+    } catch (err) {
+      setSolanaStatus("Payment failed: " + String(err));
+      setStatus("Payment failed, upload blocked");
+      return false;
+    } finally {
+      setIsPaying(false);
+    }
+  }, [
+    connectWallet,
+    connection,
+    fetchSolanaConfig,
+    programId,
+    solanaConfig,
+    usedPixels,
+    web3,
+    walletProvider,
+  ]);
+
   useEffect(() => {
     pixelsRef.current = pixels;
   }, [pixels]);
+
+  useEffect(() => {
+    if (!SOLANA_REQUIRED) return;
+
+    let active = true;
+
+    (async () => {
+      try {
+        setSolanaStatus("Loading Solana client");
+        const web3Module = await loadWeb3();
+        if (!active) return;
+
+        setWeb3(web3Module);
+        setConnection(
+          new web3Module.Connection(SOLANA_RPC_URL, SOLANA_COMMITMENT),
+        );
+
+        try {
+          setProgramId(
+            SOLANA_PROGRAM_ID
+              ? new web3Module.PublicKey(SOLANA_PROGRAM_ID)
+              : null,
+          );
+        } catch {
+          setProgramId(null);
+        }
+      } catch (err) {
+        if (!active) return;
+        setSolanaStatus("Failed to load Solana client: " + String(err));
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!SOLANA_REQUIRED) {
+      setSolanaStatus("Solana payment gate disabled");
+      return;
+    }
+
+    if (!web3 || !connection) {
+      setSolanaStatus("Loading Solana client");
+      return;
+    }
+
+    if (!programId) {
+      setSolanaStatus("Missing VITE_SOLANA_PROGRAM_ID");
+      return;
+    }
+
+    fetchSolanaConfig().catch((err) => {
+      setSolanaStatus(
+        "Config load failed, using hardcoded price: " + String(err),
+      );
+    });
+
+    if (!walletProvider) {
+      setWalletAddress("");
+      return;
+    }
+
+    const existing = walletProvider.publicKey?.toBase58?.();
+    if (existing) setWalletAddress(existing);
+
+    const onConnect = (pk) => {
+      const address =
+        pk?.toBase58?.() || walletProvider.publicKey?.toBase58?.();
+      if (address) setWalletAddress(address);
+    };
+    const onDisconnect = () => {
+      setWalletAddress("");
+    };
+
+    walletProvider.on?.("connect", onConnect);
+    walletProvider.on?.("disconnect", onDisconnect);
+    walletProvider.on?.("accountChanged", onConnect);
+
+    return () => {
+      walletProvider.off?.("connect", onConnect);
+      walletProvider.off?.("disconnect", onDisconnect);
+      walletProvider.off?.("accountChanged", onConnect);
+    };
+  }, [connection, fetchSolanaConfig, programId, walletProvider, web3]);
 
   useEffect(() => {
     const currentHash = frameHash(pixels);
@@ -657,6 +1029,7 @@ export default function App() {
   async function connectSerial() {
     if (!canUseSerial) {
       setStatus("Web Serial not supported in this browser");
+      pushToast("Web Serial not supported in this browser", "error", 4200);
       return;
     }
 
@@ -681,10 +1054,12 @@ export default function App() {
 
       setSerialState("connected");
       setStatus("Gateway connected");
+      pushToast("ESP gateway connected", "success");
       startReadLoop();
     } catch (err) {
       setSerialState("disconnected");
       setStatus("Connect failed: " + String(err));
+      pushToast("ESP connection failed", "error");
     }
   }
 
@@ -710,8 +1085,10 @@ export default function App() {
 
       setSerialState("disconnected");
       setStatus("Disconnected");
+      pushToast("ESP gateway disconnected", "info");
     } catch (err) {
       setStatus("Disconnect error: " + String(err));
+      pushToast("ESP disconnect failed", "error");
     }
   }
 
@@ -741,6 +1118,7 @@ export default function App() {
 
       if (!result.safe) {
         setStatus("Blocked by moderation policy");
+        pushToast("Moderation blocked this frame", "error", 4200);
         return false;
       }
 
@@ -772,6 +1150,7 @@ export default function App() {
         source: "none",
       });
       setStatus("Moderation failed, send blocked");
+      pushToast("Moderation failed, upload blocked", "error", 4200);
       return false;
     }
   }
@@ -782,7 +1161,7 @@ export default function App() {
       return;
     }
 
-    if (isSending) return;
+    if (isSending || isPaying) return;
 
     if (requireModeration) {
       const currentHash = frameHash(pixelsRef.current);
@@ -794,6 +1173,11 @@ export default function App() {
         const ok = await runModeration();
         if (!ok) return;
       }
+    }
+
+    if (SOLANA_REQUIRED) {
+      const paid = await payForCurrentFrame();
+      if (!paid) return;
     }
 
     try {
@@ -809,8 +1193,10 @@ export default function App() {
         setSendProgress(Math.round((sentChunks / totalChunks) * 100));
       }
       setStatus("Frame sent to gateway (" + packet.length + " bytes)");
+      pushToast("Frame uploaded to gateway", "success");
     } catch (err) {
       setStatus("Send failed: " + String(err));
+      pushToast("Frame upload failed", "error");
     } finally {
       setIsSending(false);
     }
@@ -821,11 +1207,209 @@ export default function App() {
       <header className="app-header">
         <h1>Pixel Portal</h1>
         <p className="subtitle">
-          Minimal gateway uploader with strict category moderation
+          Draw, moderate, pay per pixel on Solana, then stream to gateway
         </p>
+        <div className="status-pills">
+          <span className="pill">Gateway: {serialState}</span>
+          <span className="pill">Moderation: {moderation.state}</span>
+          {SOLANA_REQUIRED ? (
+            <span className="pill">Wallet: {shortAddress(walletAddress)}</span>
+          ) : null}
+        </div>
       </header>
 
-      <div className="toolbar">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files && e.target.files[0];
+          if (f) loadImageToCanvas(f);
+          e.target.value = "";
+        }}
+      />
+
+      <section className="control-grid">
+        <div className="control-card">
+          <h2>Moderation</h2>
+          <div className="card-row">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={requireModeration}
+                onChange={(e) => setRequireModeration(e.target.checked)}
+              />
+              Moderation required
+            </label>
+
+            <button
+              onClick={runModeration}
+              disabled={moderation.state === "checking" || isSending}
+            >
+              {moderation.state === "checking" ? (
+                <LoaderCircle size={16} className="spin" />
+              ) : (
+                <ShieldCheck size={16} />
+              )}
+              {moderation.state === "checking" ? "Checking" : "Run moderation"}
+            </button>
+
+            <button
+              className="secondary"
+              onClick={() => setShowPolicyPanel((v) => !v)}
+            >
+              <SlidersHorizontal size={16} />
+              {showPolicyPanel ? "Hide policy" : "Moderation policy"}
+            </button>
+
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={strictModeration}
+                onChange={(e) => setStrictModeration(e.target.checked)}
+              />
+              Block if API check fails
+            </label>
+          </div>
+
+          {showPolicyPanel ? (
+            <div className="policy-panel">
+              <div className="policy-header">
+                <label className="field field-inline">
+                  <span>Policy preset</span>
+                  <div className="select-wrap">
+                    <select
+                      value={policyPreset}
+                      onChange={(e) => setThresholdPreset(e.target.value)}
+                    >
+                      <option value="strict">Strict</option>
+                      <option value="balanced">Balanced</option>
+                      <option value="relaxed">Relaxed</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                    <ChevronDown size={14} />
+                  </div>
+                </label>
+              </div>
+
+              <div className="policy-grid">
+                {MODERATION_CATEGORIES.map((cat) => (
+                  <label className="policy-item" key={cat.key}>
+                    <span>
+                      {cat.label} threshold:{" "}
+                      {categoryThresholds[cat.key].toFixed(2)}
+                    </span>
+                    <input
+                      type="range"
+                      min="0.05"
+                      max="0.95"
+                      step="0.01"
+                      value={categoryThresholds[cat.key]}
+                      onChange={(e) => {
+                        const value = Number(e.target.value);
+                        setPolicyPreset("custom");
+                        setCategoryThresholds((prev) => ({
+                          ...prev,
+                          [cat.key]: value,
+                        }));
+                      }}
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        {SOLANA_REQUIRED ? (
+          <div className="control-card">
+            <h2>Solana Payment</h2>
+            <div className="card-row">
+              <button
+                onClick={async () => {
+                  try {
+                    await connectWallet();
+                  } catch (err) {
+                    setStatus("Wallet connect failed: " + String(err));
+                  }
+                }}
+                disabled={isPaying}
+                className="secondary"
+              >
+                <Wallet size={16} />
+                {walletAddress
+                  ? "Wallet " + shortAddress(walletAddress)
+                  : "Connect wallet"}
+              </button>
+            </div>
+            <div className="stats-grid">
+              <div className="stat">
+                <span>Price per pixel</span>
+                <strong>
+                  {formatLamports(priceInfo.lamports)} lamports (
+                  {priceInfo.source})
+                </strong>
+              </div>
+              <div className="stat">
+                <span>Used pixels</span>
+                <strong>{usedPixels}</strong>
+              </div>
+              <div className="stat">
+                <span>Estimated payment</span>
+                <strong>
+                  {formatLamports(estimatedLamports)} lamports (
+                  {formatSol(estimatedLamports)} SOL)
+                </strong>
+              </div>
+              <div className="stat">
+                <span>Last signature</span>
+                <strong>{lastPaymentSig || "none"}</strong>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        <div className="control-card">
+          <h2>Gateway Upload</h2>
+          <div className="card-row">
+            <button
+              onClick={connectSerial}
+              disabled={
+                serialState === "connecting" || serialState === "connected"
+              }
+            >
+              <Plug size={16} />
+              {serialState === "connecting"
+                ? "Connecting..."
+                : "Connect gateway"}
+            </button>
+            <button
+              className="primary"
+              onClick={sendToEsp}
+              disabled={serialState !== "connected" || isSending || isPaying}
+            >
+              <Send size={16} />
+              {isPaying
+                ? "Waiting for wallet confirmation"
+                : isSending
+                  ? "Sending " + sendProgress + "%"
+                  : "Upload frame to gateway"}
+            </button>
+            <button
+              className="secondary"
+              onClick={disconnectSerial}
+              disabled={serialState === "disconnected"}
+            >
+              <X size={16} />
+              Disconnect
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="editor-workbench control-card">
+        <h2>Canvas Tools</h2>
         <div className="tool-buttons">
           <button
             className={tool === "draw" ? "icon-btn active" : "icon-btn"}
@@ -862,149 +1446,53 @@ export default function App() {
           </button>
         </div>
 
-        <label className="field">
-          <span>Draw color</span>
-          <input
-            type="color"
-            value={drawColor}
-            onChange={(e) => setDrawColor(e.target.value)}
-            disabled={tool !== "draw"}
-          />
-        </label>
+        <div className="card-row">
+          <label className="field">
+            <span>Draw color</span>
+            <input
+              type="color"
+              value={drawColor}
+              onChange={(e) => setDrawColor(e.target.value)}
+              disabled={tool !== "draw"}
+            />
+          </label>
 
-        <label className="field">
-          <span>Fit mode</span>
-          <div className="select-wrap">
-            <select
-              value={fitMode}
-              onChange={(e) => setFitMode(e.target.value)}
+          <label className="field">
+            <span>Fit mode</span>
+            <div className="select-wrap">
+              <select
+                value={fitMode}
+                onChange={(e) => setFitMode(e.target.value)}
+                disabled={!hasUploadedImage}
+                title={
+                  hasUploadedImage
+                    ? "Change image fit mode"
+                    : "Upload an image first"
+                }
+              >
+                <option value="crop">Crop</option>
+                <option value="contain">Contain</option>
+              </select>
+              <ChevronDown size={14} />
+            </div>
+          </label>
+
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={pixelArtUpload}
+              onChange={(e) => setPixelArtUpload(e.target.checked)}
               disabled={!hasUploadedImage}
-              title={
-                hasUploadedImage
-                  ? "Change image fit mode"
-                  : "Upload an image first"
-              }
-            >
-              <option value="crop">Crop</option>
-              <option value="contain">Contain</option>
-            </select>
-            <ChevronDown size={14} />
-          </div>
-        </label>
+            />
+            Pixel-art upload
+          </label>
 
-        <label className="checkbox-label">
-          <input
-            type="checkbox"
-            checked={pixelArtUpload}
-            onChange={(e) => setPixelArtUpload(e.target.checked)}
-            disabled={!hasUploadedImage}
-          />
-          Pixel-art upload
-        </label>
-
-        <button onClick={() => fileInputRef.current?.click()}>
-          <Upload size={16} />
-          Load image
-        </button>
-
-        <label className="checkbox-label">
-          <input
-            type="checkbox"
-            checked={requireModeration}
-            onChange={(e) => setRequireModeration(e.target.checked)}
-          />
-          Moderation required
-        </label>
-
-        <button
-          onClick={runModeration}
-          disabled={moderation.state === "checking" || isSending}
-        >
-          {moderation.state === "checking" ? (
-            <LoaderCircle size={16} className="spin" />
-          ) : (
-            <ShieldCheck size={16} />
-          )}
-          {moderation.state === "checking" ? "Checking" : "Run moderation"}
-        </button>
-
-        <button
-          className="secondary"
-          onClick={() => setShowPolicyPanel((v) => !v)}
-        >
-          <SlidersHorizontal size={16} />
-          {showPolicyPanel ? "Hide policy" : "Moderation policy"}
-        </button>
-
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          style={{ display: "none" }}
-          onChange={(e) => {
-            const f = e.target.files && e.target.files[0];
-            if (f) loadImageToCanvas(f);
-            e.target.value = "";
-          }}
-        />
-      </div>
-
-      {showPolicyPanel ? (
-        <div className="policy-panel">
-          <div className="policy-header">
-            <label className="field field-inline">
-              <span>Policy preset</span>
-              <div className="select-wrap">
-                <select
-                  value={policyPreset}
-                  onChange={(e) => setThresholdPreset(e.target.value)}
-                >
-                  <option value="strict">Strict</option>
-                  <option value="balanced">Balanced</option>
-                  <option value="relaxed">Relaxed</option>
-                  <option value="custom">Custom</option>
-                </select>
-                <ChevronDown size={14} />
-              </div>
-            </label>
-
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={strictModeration}
-                onChange={(e) => setStrictModeration(e.target.checked)}
-              />
-              Strict block on check failure
-            </label>
-          </div>
-
-          <div className="policy-grid">
-            {MODERATION_CATEGORIES.map((cat) => (
-              <label className="policy-item" key={cat.key}>
-                <span>
-                  {cat.label} threshold:{" "}
-                  {categoryThresholds[cat.key].toFixed(2)}
-                </span>
-                <input
-                  type="range"
-                  min="0.05"
-                  max="0.95"
-                  step="0.01"
-                  value={categoryThresholds[cat.key]}
-                  onChange={(e) => {
-                    const value = Number(e.target.value);
-                    setPolicyPreset("custom");
-                    setCategoryThresholds((prev) => ({
-                      ...prev,
-                      [cat.key]: value,
-                    }));
-                  }}
-                />
-              </label>
-            ))}
-          </div>
+          <button onClick={() => fileInputRef.current?.click()}>
+            <Upload size={16} />
+            Load image
+          </button>
         </div>
-      ) : null}
+      </section>
 
       <div className="layout">
         <div className="panel">
@@ -1034,40 +1522,30 @@ export default function App() {
         </div>
       </div>
 
-      <div className="serial-row">
-        <button
-          onClick={connectSerial}
-          disabled={serialState === "connecting" || serialState === "connected"}
-        >
-          <Plug size={16} />
-          {serialState === "connecting" ? "Connecting..." : "Connect gateway"}
-        </button>
-        <button
-          onClick={sendToEsp}
-          disabled={serialState !== "connected" || isSending}
-        >
-          <Send size={16} />
-          {isSending
-            ? "Sending " + sendProgress + "%"
-            : "Upload frame to gateway"}
-        </button>
-        <button
-          onClick={disconnectSerial}
-          disabled={serialState === "disconnected"}
-        >
-          <X size={16} />
-          Disconnect
-        </button>
-      </div>
+      <section className="status-board">
+        <p className="status">{status}</p>
+        <p className="hint">Protocol: {solanaStatus}</p>
+        <p className="hint">Blocked categories: {blockedPretty}</p>
+        <p className="hint">Safety note: {moderation.reason}</p>
+        <p className="hint">Moderation API: {MODERATION_URL}</p>
+        <p className="hint">Undo: Ctrl+Z | Redo: Ctrl+Shift+Z</p>
+      </section>
 
-      <p className="status">{status}</p>
-      <p className="hint">
-        Gateway: {serialState} | Moderation: {moderation.state} | API:{" "}
-        {MODERATION_URL}
-      </p>
-      <p className="hint">Blocked categories: {blockedPretty}</p>
-      <p className="hint">Safety note: {moderation.reason}</p>
-      <p className="hint">Undo: Ctrl+Z | Redo: Ctrl+Shift+Z</p>
+      <div className="toast-region" aria-live="polite" aria-atomic="false">
+        {toasts.map((toast) => (
+          <div key={toast.id} className={"toast toast--" + toast.tone}>
+            <span>{toast.message}</span>
+            <button
+              className="toast-close"
+              onClick={() => dismissToast(toast.id)}
+              aria-label="Dismiss notification"
+              title="Dismiss"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
