@@ -2,6 +2,8 @@
 
 A proof-of-concept decentralized billboard system built with ESP32 and a 32x16 P10 RGB panel.
 
+![image](./docs/assets/images/p10led.jpeg)
+
 ## Final Vision
 
 The final project is a public web portal where anyone can:
