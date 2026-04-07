@@ -1204,7 +1204,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Pixel Billboard Portal</h1>
+        <h1>Pixel Portal</h1>
         <p className="subtitle">
           Draw, pay per pixel on Solana, moderate, then stream to gateway
         </p>
